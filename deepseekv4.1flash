@@ -1,0 +1,267 @@
+读取整个D:\Huawei_competition仓库下的内容，先读取docs下的的任务书和接口文档，再读取所有其他内容，告诉我这个仓库的内容是什么
+I'll explore the repository structure first, then read the docs.
+
+Now the demo code:
+
+这个仓库是**华为云核心网第十届编程大赛的赛题"《未来战争》v1.0"**的完整材料，包含文档和一份示例 Agent 代码。
+
+1. docs/ — 赛题文档
+任务书.md：游戏规则说明书。核心是一场 41×32 地图上的双人对战 RTS/AI 游戏：
+两方扮演"挑战者(challenger)/防守者(defender)"，各守一个基地（左上/右下）。
+一天=130 回合（白天70 + 夜晚60），最多10天（1300回合）。白天采集/建造/做任务，夜晚抵御机器人浪潮。
+角色：开拓者×1、工人×2；建筑：基地、加特林/电磁狙击炮/火箭发射台、围墙，均可升到 level3。
+中立单位：小贩（卖矿石换金币）、武器商店（买升级券/消耗品/任务用品）、任务点。
+三类任务：推理类（世界新闻影响矿产价格）、长上下文类（民间传闻→祭坛宝藏）、自进化类（任务点领取，需与沙盒环境交互并自进化出 SOP/SKILL）。
+含完整数值表、移动/攻击/碰撞规则、积分公式（任务+击杀+生存天数）和胜负判定。
+接口文档.md：HTTP 通信协议。选手程序以 HTTP Server 启动（run.sh port），判题器 POST 地图状态，程序返回指令。
+Request：roundNo、mapInfo、teamOur、teamEnemy、robot、worldNews、商店列表、错误信息等。
+Response：roleCommandMap（角色ID→动作）、prompt（提交给 LLM）、executeCmd（沙盒命令，仅任务期间可用）。
+动作全集：move/attack/sell/buy/build/remove/acceptTask/submitAnswer/summonTreasure/use/drop/collect。LLM 每个游戏日限 3 次（任务期间不计）。
+request.txt / response.txt：上述接口的真实报文样例（含完整 JSON）。
+2. demo/CoreGeek/ — 一份可运行的示例 Agent
+Python 3.11 项目（pyproject.toml，无外部依赖），入口 main3.py <port>，通过标准库 ThreadingHTTPServer 接收判题请求并调用策略。
+
+src/agent/server.py：HTTP 处理器，解析请求 → decide() → 返回 {"roleCommandMap": ...}。
+src/agent/protocol.py：协议数据模型（Pos/Unit/Robot/Turn）、昼夜判定、切比雪夫距离、单位/建筑属性与指令构造函数。
+src/agent/grid.py：A* 寻路（8方向），在障碍/机器人/建筑约束下求下一步。
+src/agent/brain.py：核心策略。白天：工人在基地旁造 3 座武器（gatling/railgun/rocket）+ 采集石头建围墙，开拓者移动到武器旁；夜晚：角色操控武器攻击最近的机器人。
+总之，这是围绕"写一个能采集、建造、防守、解题并自进化"的竞赛机器人而提供的规则书 + 接口协议 + 样例代码的起手仓库。
+
+我打算使用抓取的其他队伍的对战回放和对战记录，结合本地模拟对战微调，通过强化学习来训练我的参赛agent，你只聚焦于强化学习框架，给我设计一个强化学习训练框架
+强化学习训练框架设计（聚焦 RL 部分）
+先说结论：这类游戏（部分可观测、超长回合、结构化超大动作空间、多单位协同）不适合纯端到端 RL 从零训练。稳健路线是 "回放行为克隆 warm-start → 离线 RL → 本地模拟器自博弈在线微调" 三段式，并把动作空间降维成"高层意图 + 脚本执行器（options）"。下面给出可落地的框架。
+
+0. 关键前提（框架的硬依赖）
+RL 要成立，必须有 一个可编程、可重置、带 seed、能吐全图状态和逐回合奖励的本地模拟器。判题器的 HTTP 接口太慢且不给奖励信号，不能当训练环境。所以框架第 0 层就是"模拟器适配器"。全图状态给 critic（CTDE），带迷雾的局部观测给 actor。
+
+1. 环境层 envs/
+sim_client.py：把本地模拟器包成进程/HTTP 桥，负责 reset/step、seed、双阵营换边、对手注入。
+future_war_env.py：Gymnasium（多智能体则 PettingZoo）风格 Env。
+reset(seed, opponent, side) → obs；step(role_actions) → obs, reward, done, info。
+用 gym.vector / Ray 做并行环境提升采样吞吐。
+spaces.py：定义观测/动作空间（见下）。
+action_codec.py：策略动作 ↔ 接口 roleCommandMap 的双向编解码，并做合法性校验。
+obs_encoder.py：原始 payload → 张量。
+多通道网格：地形、矿区、己方建筑/单位、可见敌方、机器人、迷雾 mask。
+向量特征：金币、回合/昼夜、各建筑等级与冷却、任务冷却/奖励。
+实体序列：小贩/商店/任务点/矿石坐标编码。
+文本：phaseTask 与 worldNews 用冻结小模型（如 sentence embedding）编码。
+reward.py：可配置奖励整形（见第 5 节）。
+观测与动作空间（核心降维）
+动作空间 = 分层 options（关键决策）
+
+单局 1300 回合，若每回合每角色独立动作，credit assignment 极难。改为 temporally-extended actions：策略选一个"意图"，执行器（A*/规则）把它跑若干回合直到完成或失败。
+Level-1（RL 学的，每个可控角色一个头）：{go_collect, go_build, build_now, attack, go_heal, sell, buy, use, task_op, summon_treasure, drop, idle}。
+Level-2（候选点选择，RL 学的 pointer/masked-categorical）：在候选实体槽位上选目标——最近矿、待建点、机器人、商店等。用 candidate-based / pointer 头避免对 41×32 全网格回归坐标。
+复用现成 grid.next_step 做低层寻路，不进入梯度。
+action_mask.py：按昼夜、资源、邻接、冷却、背包约束生成合法动作 mask（PPO 必须支持 masked 分布）。
+2. 数据层 / 离线 RL data/
+replay_parser.py：把抓取的回放/对战记录解析成标准 transition： (obs, action, mask, reward, next_obs, done, side, opponent_id)，并做 换边镜像数据增强（本游戏左右对称，可直接翻倍数据、提升泛化）。
+序列化存储（供 RNN/Transformer 记忆核用），带优先级采样。
+ghost_policies.py：对每个被抓队伍的录像训练一个 BC 策略，作为自博弈中"真人风格对手池"。
+以仓库现有 demo/CoreGeek 定式 bot 作为基线 BC target 与评估对手。
+3. 模型层 models/
+encoder.py：CNN（网格）+ Transformer/MLP（实体）+ 文本 embedding 融合。
+policy.py：actor-critic。
+去中心化 actor（只看局部观测+历史）用 GRU/Transformer 记忆核处理 POMDP。
+每个角色一个动作头 + 共享参数；参数头（候选点）用 masked pointer。
+critic.py：中心化 critic（CTDE），输入全图状态，输出全局价值——显著降低多智能体方差。
+4. 算法层 algos/
+三段式流水线，共享同一 env 与模型：
+
+bc.py：在回放数据上交叉熵预训练（动作头 + mask）。冷启动，决定下限。
+offline_iql.py（或 CQL/TD3+BC）：在回放 buffer 上做离线 RL，安全利用人类/对手数据，不需与环境交互。
+ppo.py：带 GAE、clip、KL 控制的在线 PPO（RNN 版用序列回放，R2D2 风格），在本地模拟器中自博弈微调。
+selfplay.py / league.py：
+对手池 = 历史 checkpoint + BC ghosts + 规则 bot；
+PFSP（按胜率优先采样）+ ELO 跟踪，防过拟合、防策略退化；
+保存并周期评测 champion。
+课程学习：先"仅生存 vs 固定机器人波次" → 再 vs 规则 bot → 再自博弈 → 最后混入 ghost 对手。
+
+5. 奖励设计
+终局奖励 = 官方积分（score1 + score2 + score3，任务分/击杀分/生存天数分），统一量纲后为主信号。
+稠密整形：金币增量、成功建造/升级、击杀机器人、基地血量变化、任务进度、矿采集量、exploration 奖励。
+用 差分奖励（score 增量）而非绝对值，避免"熬时间"局部最优；对机器人召唤/眩晕等物品使用给予稀疏正/负信号。
+奖励权重进 config，便于消融。
+6. 编排与基础设施 runners/ configs/
+train_bc.py / train_offline.py / train_online.py / evaluate.py 统一入口。
+Hydra/OmegaConf 管理配置；TensorBoard/W&B 记录。
+checkpoint、确定性 seed、episode 回放日志。
+分布式：env 跑 CPU 并行，learner 跑 GPU（Ray RLlib 或自研 actor-learner）。
+evaluate.py：对固定对手套件做 round-robin，输出胜率/ELO/积分构成、半场换边一致性。
+7. 目录结构建议
+rl/
+  configs/        # env/bc/offline/ppo_selfplay yaml
+  envs/           # sim_client, future_war_env, spaces, obs_encoder, action_codec, action_mask, reward
+  data/           # replay_parser, dataset, ghost_policies
+  models/         # encoder, policy, critic
+  algos/          # bc, offline_iql, ppo, selfplay, league
+  runners/        # train_bc, train_offline, train_online, evaluate
+  opponent_pool/  checkpoints/  logs/
+8. LLM/沙盒任务的处理（建议排除在 RL 梯度之外）
+自进化类的 prompt/executeCmd/答案文本不适合梯度 RL。建议：RL 只学元决策（是否接任务、何时派开拓者、任务点选择），文本求解交给独立工具模块 / 小模型，其成功率作为环境的随机因素进入奖励。推理/长上下文类任务同理降级为观测特征。
+
+主要风险
+模拟器是命脉：没有高保真、快速的本地模拟器，整个方案不成立——这是第一优先级和最大不确定性。
+端到端从零 RL 几乎必然失败；收益主要来自 BC + 自博弈微调。
+1300 回合长视界必须靠 options + 中心化 critic + GAE 缓解。
+在我把上面的框架细化成可执行实现计划前，需要先确认几个会改变设计走向的问题：
+
+已收到你的选择：自建 agent 式本地模拟器 + 宏观意图/脚本执行器 + PyTorch&PettingZoo + CPU 或轻量 GPU。据此把框架收敛为一套明确、可落地的实现方案。CPU 预算意味着要严格控制模型与视界，因此下面所有设计都围绕"小模型 + 宏动作 + 离线为主、在线为辅"。
+
+A. 总体架构
+[回放/录像] --replay_parser--> 离线数据集(BC/IQL)
+                                     |
+[本地模拟器] --sim_client--> PettingZoo ParallelEnv --+
+                                                       |-- rollout --> PPO(自博弈)
+[对手池: 规则bot/BC ghost/历史ckpt] --opponent.py -----+                 |
+                                                                     league(PFSP+ELO)
+                                                                        |
+                                                    export_policy --> 竞赛 HTTP 服务 (main3)
+三段式：BC warm-start → 离线 IQL → 在线 PPO 自博弈微调。CPU 下 BC/离线是主力，在线只做小规模精修。
+
+B. 目录与模块（新增 rl/，不改动 demo/、docs/）
+rl/
+  configs/        sim.yaml obs_action.yaml bc.yaml iql.yaml ppo.yaml league.yaml
+  sim/
+    sim_client.py      # 本地模拟器进程/函数桥：reset/step/seed/全图state
+    sim_validate.py    # 回放驱动的模拟器保真度校验（关键）
+  envs/
+    future_war_pz.py   # PettingZoo ParallelEnv 封装
+    executor.py        # 宏观意图 -> 逐回合底层指令（复用 grid.next_step / A*）
+    opponent.py        # 对手策略：rulebot | bc_ghost | historical_ckpt | http_agent
+    obs_builder.py     # payload -> 张量观测（actor局部/ critic全局）
+    action_space.py    # Dict(intent, target) 定义
+    action_mask.py     # 每回合合法性 mask
+    reward.py          # 奖励整形
+  data/
+    replay_parser.py   # 录像 -> transitions 序列
+    intent_labeler.py  # 底层动作 -> 宏观意图标签（BC 必需）
+    dataset.py augment.py   # 序列数据集 + 换边镜像增强
+  models/
+    encoder.py actor_critic.py
+  algos/
+    bc.py iql.py ppo.py league.py rollout.py
+  runners/
+    train_bc.py train_iql.py train_ppo.py evaluate.py export_policy.py
+  serving/
+    policy_server.py   # 与 main3.py 同协议的推理服务
+C. 环境层（PettingZoo ParallelEnv）
+possible_agents = ["pioneer", "worker0", "worker1"]，死亡/未复活用 alive mask 表示，不做动态增减。
+step(actions: dict) → (obs, rewards, terminations, truncations, infos)；团队共享奖励（全合作）。
+reset(seed, options={"side","opponent","start_day"})；对手在 env 内部运行（非 agent），由 opponent.py 注入。
+中心化 critic 通过 env.state() 拿全图状态；actor 只拿带迷雾的局部观测。
+动作重复（semi-MDP）：v1 采用固定宏步长 H 回合（建议 H=5）。策略选一次意图后，executor 连续 H 回合朝目标执行底层指令；中途失败/完成则提前返回。把有效决策视界从 ~1300 缩到 ~150–260，PPO 才可训（v2 再升级为变长 option）。
+动作空间（Struct，含 mask）
+intent: Discrete(K=12)  # go_collect, go_build, build_now, attack, sell, buy,
+                        # use_item, task_accept, submit, summon, drop, idle
+target: Discrete(N_max=16)  # 候选实体指针：矿/建造点/机器人/商店/任务点，按距离排序，含 abort
+infos[agent]["action_mask"] = {"intent": ..., "target": ...}，策略用 masked softmax。
+坐标不直接回归，全部走候选点 pointer，避免 41×32 大网格坐标问题。
+合法性完全由 action_mask 保证（昼夜、资源、相邻、冷却、背包、等级）。
+观测
+网格通道 ~10 张：地形、矿、己方建筑/角色、可见敌方、机器人、迷雾 mask 等。
+向量：金币、回合/昼夜、各建筑等级与冷却、任务冷却/奖励、背包计数。
+候选实体特征：类型 one-hot + 相对坐标 + 血量等。
+文本 phaseTask/worldNews/folkLegends 用冻结小 embedding 或关键词特征（CPU 友好，不做端到端 LLM）。
+D. 模型（CPU/轻量 GPU 定位，<1M 参数）
+编码器：3 层 Conv(32/64/64) + 实体 MLP(64) + 角色 embedding 共享。
+记忆核：GRU(128)（不用 Transformer）。
+头：intent 分类头 + target pointer（对候选点打分），带 mask。
+Actor-Critic 共享主干，CTDE 中心化 critic 输入全局 state。
+输出确定性策略导出给竞赛服务；训练用随机策略采样。
+E. 算法与训练阶段
+阶段	数据/环境	算法	目标
+A. BC	抓取回放 + demo bot 自对局	交叉熵（intent+target，带 mask）	冷启动下限
+B. 离线	回放 buffer（1–5M）	IQL（expectile 0.7）	安全利用录像，无需交互
+C. 在线	本地模拟器	PPO+GAE（clip .2, γ.99, λ.95, lr 3e-4, ent .01），8–16 并行 env，horizon 256	对规则bot→自博弈微调
+D. 联赛	对手池	PFSP + ELO（保持 2–4 快照）	防过拟合/退化
+课程：仅生存 vs 机器人波次 → vs demo 规则bot → vs BC ghost → 自博弈。
+
+奖励：主信号=官方积分差分（score1+score2+score3）；稠密项=金币/建造/击杀/基地血量/任务进度/采集，差分式并做 running normalization（避免"熬时间"）。
+
+F. 关键工程点
+模拟器保真度校验（最高优先级）：sim_validate.py 用录像逐回合回放，比较 lastRoundRoleActionResults、坐标、血量、金币、机器人数量；匹配率 <99% 先修模拟器，否则 RL 学的是错误动力学（sim2real gap）。
+意图标注：intent_labeler.py 把录像里的底层动作序列反推成宏观意图标签，这是 BC 能用的前提。
+换边镜像增强：地图左右对称，直接翻倍数据并提升泛化。
+确定性：seed 固定、环境可复现；训练/评估分离。
+导出：export_policy.py → serving/policy_server.py，协议与 demo/CoreGeek/main3.py 一致（roleCommandMap），复用其 HTTP 外壳。
+LLM/沙盒任务移出 RL 梯度：RL 只学"是否/何时接任务、派谁"，文本求解交给独立工具模块，成功率作为环境随机性进入奖励。
+G. 实施里程碑
+M0：sim_client + sim_validate 打通，回放校验达标。
+M1：future_war_pz + executor + obs/action/mask 可跑随机策略，与 demo bot 对局。
+M2：replay_parser+intent_labeler+BC，评估 vs 规则 bot。
+M3：IQL 离线训练并评估。
+M4：PPO 自博弈 + 联赛，evaluate.py 输出 ELO/胜率/积分构成。
+M5：export_policy + policy_server 接入竞赛协议，做端到端 sanity test。
+H. 主要风险
+自建模拟器保真度是成败关键——先用录像严格校验，再谈 RL。
+CPU 预算下不能指望大规模在线 RL；收益主要来自 BC + IQL，在线只做小步精修。
+1300 回合长视界必须靠宏动作 + 中心化 critic 缓解。
+如果这个方案方向认可，我可以按 M0→M5 开始实现（默认先落地 M0–M1 环境与校验，再接 BC）。你也可以指出想调整的点，比如是否先跳过 IQL 直接 BC→PPO。
+
+
+
+不用给出具体目录模块和本地模拟部署的具体情况，这些都对你抽象封闭了，你只需要聚焦强化训练框架的设计即可，重新整理你的回答
+强化学习训练框架设计（纯 RL 视角）
+1. 问题形式化
+类型：部分可观测、多智能体协作、长视界回合制 POMDP。
+建模方式：我方 3 个可控角色（开拓者 + 2 工人）视为协作 agent（共享团队奖励）；敌方为环境的一部分，由对手策略驱动，不作为 agent 学习。
+决策单元：采用 semi-MDP（宏动作 / options）。策略只在 option 边界做决策，底层逐回合执行由脚本执行器完成。固定宏步长 H（建议 5 回合）作为 v1，显著压缩有效视界（1300 → ~150–260），这是长视界可训的前提。
+中心化训练 / 去中心化执行（CTDE）：actor 只看带迷雾的局部观测，critic 看到全图全局状态，降低多智能体方差。
+2. RL 与环境之间的抽象契约
+框架只依赖环境的以下能力（不关心其实现）：
+
+reset(seed, side, opponent)、step(actions)、全图状态读取、可复现随机性。
+双阵营换边：同一策略需在两侧对称可训练/可评估。
+对手注入：环境接受任意对手策略（规则 bot / 行为克隆 ghost / 历史 checkpoint / 自博弈角色）。
+所有与环境的耦合收敛到一层薄适配，其余部分对框架透明。
+
+3. 观测设计
+网格特征（供 CNN）：地形、矿区、己方建筑/角色、视野内敌方、机器人的多通道栅格 + 迷雾 mask。
+全局向量：金币、回合与昼夜、各建筑等级/冷却、任务奖励与冷却、背包计数。
+候选实体特征：矿/建造点/商店/任务点/机器人，编码类型 + 相对坐标 + 血量等（供 pointer 头）。
+文本信息（任务描述、世界新闻、民间传闻）：冻结的小型 embedding 或关键词特征，不做端到端 LLM。
+输出分为 局部观测（actor） 与 全局状态（critic） 两套。
+4. 动作空间设计（核心降维）
+分层：intent（高层意图）+ target（候选实体指针）。
+intent：采集、建造、操控攻击、贩卖、购买、用物品、任务相关、丢弃、待机等约 12 类。
+target：在候选实体槽位（≤16，按距离排序，含"放弃"）上做 pointer 选择。
+不回归坐标，全部走候选点，规避 41×32 大网格、提升样本效率。
+动作掩码：按昼夜、资源、相邻、冷却、背包、等级生成每回合合法 mask，策略用 masked softmax；非法动作永不采样。
+复用确定性的寻路/合法性脚本作为执行器，把"目标选择"交给 RL，把"怎么走"交给规则。
+5. 奖励设计
+主信号：官方积分差分（任务分 + 击杀分 + 生存天数分），统一量纲。
+稠密整形：金币、成功建造/升级、击杀、基地血量变化、采集量、任务进度；均用差分而非绝对值（抑制"熬时间"局部最优）。
+关键物品决策（召唤令、眩晕、炸弹）给稀疏正/负信号。
+奖励做 running normalization；各项权重进配置便于消融。
+6. 策略网络
+小规模编码器：CNN（网格）+ MLP（实体）+ 角色 embedding 共享。
+GRU 记忆核（处理 POMDP，避免 Transformer 开销）。
+双头：intent 分类 + target pointer，均带 mask。
+Actor-Critic 共享主干，critic 输入全局状态。
+7. 训练范式（三段式 + 联赛）
+行为克隆（warm-start）：在抓取回放 + 基线 bot 自对局上做带 mask 的交叉熵，确立下限。
+离线 RL：在回放 buffer 上做 IQL（expectile 0.7），安全利用对手/人类数据，无需环境交互。
+在线 RL 微调：PPO + GAE 在本地环境中训练，从"对规则 bot"逐步过渡到"自博弈"。
+联赛（League / PFSP + ELO）：对手池 = 历史 checkpoint + BC ghost + 规则 bot，按胜率优先采样，定期冻结 champion，防过拟合与策略退化。
+课程学习：仅生存（vs 机器人波次）→ vs 规则 bot → vs BC ghost → 自博弈。
+
+关键配套：
+
+回放意图标注：把录像中的底层动作序列反推为宏动作标签，BC 才能用。
+换边镜像数据增强：地图左右对称，直接扩增一倍数据并提升对称泛化。
+8. 算法与超参（CPU / 轻量 GPU 约束）
+模型 <1M 参数；PPO 并行环境 8–16，horizon ~256，batch 512。
+PPO：γ≈0.99、λ≈0.95、clip 0.2、lr 3e-4、entropy 0.01。
+IQL：expectile/tau 0.7、lr 3e-4；回放 buffer 1–5M。
+因算力受限，收益主要来自 BC + 离线 RL，在线仅做小步精修；宏动作是控制样本量的手段。
+9. 评估与迭代
+固定对手套件做 round-robin，输出 ELO、胜率、积分构成。
+半场换边一致性检查（消除先后手/位置偏差）。
+与在线判题器做端到端 sanity 验证，监控 sim2real gap。
+10. 主要风险
+模拟器保真度决定上限：需用录像做逐回合一致性校验，否则 RL 学到错误动力学。
+端到端从零 RL 基本不可行；框架必须坚持"BC + 离线为主、在线为辅"。
+长视界靠宏动作 + 中心化 critic + GAE 缓解。
+方向认可的话，我可以下一步把它细化为可执行的实现计划（以"BC → 离线 IQL → 在线 PPO 自博弈"为主线），你也可以指定先砍掉某一阶段（例如跳过 IQL 直接 BC→PPO）。
